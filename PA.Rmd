@@ -1,0 +1,190 @@
+---
+title: "Predicting Exercise Quality from Accelerometer Data with Machine Learning"
+author: "Saeed Pouryazdian"
+output: html_document
+---
+
+## Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.
+
+In this project, we will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways:
+
+- Class A: exactly according to the specification
+- Class B: throwing the elbows to the front
+- Class C: lifting the dumbbell only halfway
+- Class D: lowering the dumbbell only halfway
+- Class E: throwing the hips to the front
+
+More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+## Goal
+The goal of this project of the Coursera Practical Machine Learning course is to predict the manner in which people did the exercise. This is the "class" variable in the training set.
+Here in this report we describe:
+- How this model is built;
+- How cross validation is used;
+- What the expected out of sample error is;
+- Justification of the made choices;
+- Results of prediction model predicting 20 different test cases
+
+## Data Preparation
+# Getting the data and Reproducibility 
+
+We Load the training and test data sets. We wil use the test set for the final validation.
+We also set the working directory and start with loading the required libraries. For futher reproducibility, we will set seeds before we create different models.
+
+```{r, message = FALSE, warning = FALSE}
+library(plyr)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(lattice)
+library(rattle)
+library(rasterVis)
+
+# Downloading the file from the URL incase of non-existence into the working directory
+trainURL <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testURL <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+TrainFile <- "./pml-training.csv"
+TestFile <- "./pml-testing.csv"
+if (!file.exists(TrainFile) || !file.exists(TestFile)) {
+  download.file(testURL, TestFile)
+  download.file(trainURL, TrainFile)
+}
+# read training and testing data for coursera course. 
+trainData <- read.csv(TrainFile, header=TRUE, sep=",", na.strings=c("NA","#DIV/0!",""))
+testData <- read.csv(TestFile, header=TRUE, sep=",", na.strings=c("NA","#DIV/0!",""))
+```
+
+# Cleaning and Data Wrangling 
+The original data sets included two sets of extraneous variables namely:
+
+1- Tracking specific variables: Variables that contain record specific information (login, test number, etc.) that would be useless for model building.
+2- Zero varience variables: Variables that have zero-variance (or near zero variance) which is meaningless to the machine learning models.
+3- Aggregate specific variables: Calculations that are done on an aggregate of records. Hence, these variables contain mainly NA's (~90%).
+
+we calculate the percentage of missing values in each of the variables in the original train and test datasets.
+
+```{r, message = FALSE, warning = FALSE}
+NApercentTrain <- sapply(trainData, function(df) {sum(is.na(df)==TRUE)/length(df)})
+NApercentTest <- sapply(testData, function(df) {sum(is.na(df)==TRUE)/length(df)})
+table(NApercentTrain > .97)
+```
+The result indicates that 100 variables in both datasets have more that 97% missing values. Therefore we decide to remove these 100 variables from the train and test dataset.
+
+```{r, message = FALSE, warning = FALSE}
+# Identifying tracking specific variables
+toMatch <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+removeColumns <- grep(paste(toMatch,collapse="|"), colnames(trainData))
+
+# Identifying Zero Varience Values
+nzv <- nearZeroVar(trainData, saveMetrics = TRUE)
+removeColumns <- c(removeColumns,which(nzv$nzv == TRUE))
+
+# Identifying aggregate specific variables
+AggregateVals <- names(trainData[,colSums(is.na(trainData), na.rm = FALSE) > 0.97*nrow(trainData)])
+NAColumns <- grep(paste(AggregateVals,collapse="|"), colnames(trainData))
+removeColumns <- c(removeColumns,NAColumns)
+
+# Finalizing the variables
+removeColumns <- unique(removeColumns)
+removeColumns <- sort(removeColumns)
+
+#Preparing Tidy Data Sets
+trainDataTidy <- trainData[,-removeColumns]
+testDataTidy <- testData[,-removeColumns]
+```
+As a result, the final training dataset being used for this analysis will have 54 variables and testing dataset will have 53 variables.
+
+```{r, message = FALSE, warning = FALSE}
+# creating a table
+TT <- t(data.frame(dim(trainDataTidy),dim(testDataTidy), 
+             row.names = c("# of Observations","# of Variables")))
+row.names(TT) = c("Tidy Train Data","Tidy Test Data")
+knitr::kable(TT, align = 'c')
+```
+
+# Data Splitting: Preparing Cross-Validation Data Set
+
+Since the training data set is such a huge proportion of the available data, a data partition of $p=0.7$ was used on the training data set to split it into a training and a cross-validation set. This split would provide $12,778$ observation for training and $6844$ for cross-validation. This would leave us with $~70\%$ of available data for model training and $30\%$ for model testing (more specifically, $29.92\%$ for cross-validation and $0.010\%$ for testing).
+
+The code below details how the cross-validation data set was created.
+```{r, message = FALSE, warning = FALSE}
+set.seed(112)
+inTest <- createDataPartition(y=trainDataTidy$classe,
+                               p=0.7, list=FALSE)
+training <- trainDataTidy[inTest,] 
+crossVal <- trainDataTidy[-inTest,]
+```
+
+# Exploratory Data Analysis
+Analysis was done on the cleaned training data set, to detect outliers and certain anomalies that might effect certain models.
+- Remove highly correlated variables: Highly correlated variables can sometimes reduce the performance of a model, and need to be excluded. However, this way of selection is disputable and the problem is highly addressed in the literature.
+
+```{r, message = FALSE, warning = FALSE}
+# check the correlations
+trainDataTidy1 <- trainDataTidy
+for (i in 1:ncol(trainDataTidy)) {
+trainDataTidy1[,i] <- as.numeric(trainDataTidy[,i])
+}
+cor.check <- cor(trainDataTidy1)
+plot( levelplot(cor.check, 
+                main ="Correlation matrix for all the features in training set",
+                scales=list(x=list(rot=90), cex=1.0),
+                par.settings = RdBuTheme()))
+```
+
+We can see that there are high correlations between some variables that implies techniques such as PCA to could be effectively incorporated to reduce the number of variables. PCA would also help reduce computation complexity and increase numerical stability. We apply a PCA which retains $98\%$ of the variance. 
+
+## Model fitting
+The choice of the appropriate model in machine learning is a difficult choice as it depends on the nature and characteristics problem being modeled. In this study we have classification problem and I intend to use random forest method for modeling. The reason is that we sill have a large mount of variables and random forest in particular is well suited for handling large number of variables in prediction. It also selects important variables automatically and is very robust when it comes to outliers and correlated variables. There are lots of other reasons as to why random forest is a powerful methodology, but I believe these few reasons justify our choice.
+
+We therefore use random forest with $10$ folds cross validation, a common choice for the number of folds. We limit the number of trees to $200$ as you will see in the following section that in terms of the errors, $200$ is sufficinetly large.
+
+```{r, message = FALSE, warning = FALSE}
+
+ctrl <- trainControl(method = "cv", number=10)
+
+rf_fit <- train(classe ~ ., data = training, method = "rf", preProcess = "pca", thresh = 0.98,
+                trControl = ctrl, allowParallel=TRUE, ntree=200)
+
+print(rf_fit)
+
+```
+
+# Plotting some diagnostics for the fitted model
+First we plot the Out-Of-Bag (OOB) error-rate vs. number of trees. 
+```{r, message = FALSE, warning = FALSE}
+# plot the Out of bag error estimates
+plot(rf_fit$finalModel, log="y", main ="Out-of-bag (OOB) error estimate per Number of Trees")
+```
+
+The next graph demonstrates the order of importance of the predictors. As you can observe the $PC8$ is the most important predictor which is a combination of all predictors in the original tidy dataset.
+
+```{r, message = FALSE}
+print(plot(varImp(rf_fit)))
+```
+
+## Evaluating the fitted model
+Now its time to evaluate the fitted model by using it to predict validation data set. We compute the confusion matrix and associated statistics to asses the preformance of the model fit:
+
+```{r, message = FALSE}
+pre_rf <- predict(rf_fit, newdata = crossVal)
+confusionMatrix(data = pre_rf, crossVal$classe)
+```
+
+That is a pretty amazingly good model with $0.99$ accuracy. The graph below also demonstrates how the fitted model correctly predicted majority of the classes. To construct this graph I only selected two arbitrary variables.
+
+```{r, message = FALSE}
+predRight <- pre_rf == crossVal$classe
+qplot(accel_belt_x,accel_belt_y, data=crossVal, colour = predRight)   
+```
+
+## Prediction new values from the test dataset
+Now the final step would be to use the fitted model to predict $classe$ for the origional testing dataset. The result presents the final predictions for the original test data.
+
+```{r, message = FALSE}
+finalResult <- predict(rf_fit, testDataTidy)
+finalResult
+```
